@@ -88,7 +88,7 @@
           <th>Variable</th>
           <th>Wert</th>
           <th>Letztes Update</th>
-          <th>Δt (s)</th>
+          <th>Δt (ms)</th>
         </tr>
       </thead>
       <tbody id="tbody"></tbody>
@@ -252,7 +252,7 @@
       if (!parsed) return;
       const { name, value } = parsed;
 
-      const now = Date.now() / 1000; // Sekunden als float
+      const now = Date.now() ; // Sekunden als float
       const tsStr = new Date().toLocaleTimeString('de-DE', { hour12: false });
 
       let entry = state.get(name);
