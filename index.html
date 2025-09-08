@@ -1,0 +1,362 @@
+<!doctype html>
+<html lang="de">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1" />
+  <title>ESP32 Live-Variablen (Web Serial)</title>
+  <style>
+    :root {
+      --bg:#0b0f14; --card:#121821; --muted:#6b7a8c; --fg:#e7eef7;
+      --acc:#20c05c; --warn:#e24a4a; --border:#233042;
+    }
+    html,body{height:100%}
+    body{
+      margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial;
+      background:var(--bg); color:var(--fg);
+      display:flex; flex-direction:column; gap:12px;
+    }
+    header{
+      display:flex; gap:10px; align-items:center; padding:12px;
+      background:var(--card); border-bottom:1px solid var(--border);
+      flex-wrap:wrap;
+    }
+    h1{font-size:16px; margin:0 12px 0 0; color:#cfe5ff; font-weight:600}
+    .row{display:flex; gap:8px; align-items:center; flex-wrap:wrap}
+    .label{color:var(--muted); font-size:14px}
+    select,button{
+      background:#0d131b; color:var(--fg); border:1px solid var(--border);
+      padding:8px 10px; border-radius:8px; font-size:14px
+    }
+    button{cursor:pointer}
+    button.primary{background:#11251a; border-color:#1b4a2f}
+    button.danger{background:#2a1313; border-color:#4a1b1b}
+    button:disabled{opacity:.5; cursor:not-allowed}
+    #status{margin-left:auto; font-weight:600}
+    #status.ok{color:var(--acc)}
+    #status.err{color:var(--warn)}
+
+    main{padding:0 12px 12px}
+    table{
+      width:100%; border-collapse:collapse; background:var(--card);
+      border:1px solid var(--border); border-radius:12px; overflow:hidden
+    }
+    thead th{
+      text-align:left; padding:10px; color:#b9c9dd; font-weight:600;
+      background:#0e141c; border-bottom:1px solid var(--border)
+    }
+    tbody td{padding:10px; border-top:1px solid var(--border)}
+    tbody tr.changed{animation:flash .6s}
+    @keyframes flash{
+      0%{background:#0f2316}
+      100%{background:transparent}
+    }
+    /* Variablennamen exakt anzeigen (Spaces erhalten) */
+    td.var { white-space: pre; }
+    td.value { text-align:center }
+    td.ts, td.dt { text-align:right; color:var(--muted) }
+    footer{padding:0 12px 12px; color:var(--muted); font-size:12px}
+    code{background:#0d131b; padding:2px 6px; border-radius:6px; border:1px solid var(--border)}
+  </style>
+</head>
+<body>
+  <header>
+    <h1>ESP32 Live-Variablen</h1>
+    <div class="row">
+      <button id="pickBtn">Port wählen</button>
+      <span class="label">Baud:</span>
+      <select id="baud">
+        <option>9600</option>
+        <option>19200</option>
+        <option>38400</option>
+        <option>57600</option>
+        <option selected>115200</option>
+        <option>230400</option>
+        <option>460800</option>
+        <option>921600</option>
+      </select>
+      <button id="connectBtn" class="primary">Verbinden</button>
+      <button id="disconnectBtn" disabled>Trennen</button>
+      <button id="resetBtn" class="danger">Reset</button>
+    </div>
+    <div id="status">Disconnected</div>
+  </header>
+
+  <main>
+    <table id="tbl">
+      <thead>
+        <tr>
+          <th>Variable</th>
+          <th>Wert</th>
+          <th>Letztes Update</th>
+          <th>Δt (s)</th>
+        </tr>
+      </thead>
+      <tbody id="tbody"></tbody>
+    </table>
+  </main>
+
+  <footer>
+    Läuft nur in Chrome/Edge über HTTPS (Web Serial). Parser: <code>name: value</code>, oder <code>name ... value</code>, oder <code>name123.4</code> (Zahl am Zeilenende).  
+    Nach Connect sendet die Seite automatisch <code>okey\n</code> an den ESP.
+  </footer>
+
+  <script>
+    // ======= Einstellungen =======
+    const HILITE_MS = 600;
+    const SORT_CASE_INSENSITIVE = true;
+
+    // ======= State =======
+    let port = null;
+    let reader = null;
+    let inputDone = null;
+    let outputWriter = null;
+    let connected = false;
+    const state = new Map(); // name -> { val, tPrev, tLast, tr }
+
+    const $ = sel => document.querySelector(sel);
+    const statusEl = $('#status');
+    const tbody = $('#tbody');
+    const connectBtn = $('#connectBtn');
+    const disconnectBtn = $('#disconnectBtn');
+    const pickBtn = $('#pickBtn');
+    const resetBtn = $('#resetBtn');
+    const baudSel = $('#baud');
+
+    function setStatus(txt, cls='') {
+      statusEl.textContent = txt;
+      statusEl.className = cls;
+    }
+
+    // ======= Port auswählen =======
+    pickBtn.addEventListener('click', async () => {
+      try {
+        const p = await navigator.serial.requestPort(); // User-Chooser
+        port = p;
+        setStatus('Port gewählt', '');
+      } catch (e) {
+        setStatus('Port-Auswahl abgebrochen', 'err');
+      }
+    });
+
+    // ======= Verbinden =======
+    connectBtn.addEventListener('click', async () => {
+      if (connected) return;
+      try {
+        // Falls noch kein Port explizit gewählt: evtl. bereits erlaubte Ports nehmen
+        if (!port) {
+          const ports = await navigator.serial.getPorts();
+          if (ports.length) {
+            port = ports[0];
+          } else {
+            // erzwingt Auswahl-Dialog
+            port = await navigator.serial.requestPort();
+          }
+        }
+        const baudRate = parseInt(baudSel.value, 10) || 115200;
+        await port.open({ baudRate });
+
+        // Writer holen, "okey\n" senden
+        if (port.writable) {
+          outputWriter = port.writable.getWriter();
+          const enc = new TextEncoder();
+          await outputWriter.write(enc.encode('okey\n'));
+          outputWriter.releaseLock();
+          outputWriter = null;
+        }
+
+        // Reader starten
+        const decoder = new TextDecoderStream();
+        inputDone = port.readable.pipeTo(decoder.writable);
+        reader = decoder.readable.getReader();
+
+        connected = true;
+        connectBtn.disabled = true;
+        disconnectBtn.disabled = false;
+        pickBtn.disabled = true;
+        baudSel.disabled = true;
+        setStatus('Connected', 'ok');
+
+        readLoop().catch(err => {
+          console.error(err);
+          setStatus('Lesefehler', 'err');
+          doDisconnect();
+        });
+
+      } catch (e) {
+        console.error(e);
+        setStatus('Connect failed', 'err');
+      }
+    });
+
+    // ======= Trennen =======
+    disconnectBtn.addEventListener('click', () => doDisconnect());
+    async function doDisconnect() {
+      try {
+        connected = false;
+        // Reader stoppen
+        if (reader) {
+          try { await reader.cancel(); } catch(_) {}
+          try { reader.releaseLock(); } catch(_) {}
+          reader = null;
+        }
+        if (inputDone) {
+          try { await inputDone; } catch(_) {}
+          inputDone = null;
+        }
+        // Port schließen
+        if (port) {
+          try { await port.close(); } catch(_) {}
+        }
+      } finally {
+        connectBtn.disabled = false;
+        disconnectBtn.disabled = true;
+        pickBtn.disabled = false;
+        baudSel.disabled = false;
+        setStatus('Disconnected', '');
+      }
+    }
+
+    // ======= Reset =======
+    resetBtn.addEventListener('click', () => {
+      // Tabelle leeren
+      tbody.innerHTML = '';
+      // State leeren
+      state.clear();
+      setStatus('Reset done', '');
+    });
+
+    // ======= Lesen & Parsen =======
+    async function readLoop() {
+      let buffer = '';
+      while (connected && reader) {
+        const { value, done } = await reader.read();
+        if (done) break;
+        if (value) {
+          buffer += value;
+          // Zeilenweise verarbeiten (\r\n oder \n)
+          let idx;
+          while ((idx = buffer.search(/\r?\n/)) >= 0) {
+            const line = buffer.slice(0, idx);
+            buffer = buffer.slice(buffer.slice(idx).match(/^\r?\n/)[0].length + idx);
+            handleLine(line);
+          }
+        }
+      }
+    }
+
+    function handleLine(rawLine) {
+      const line = rawLine.replace(/\r?\n$/, ''); // nur Zeilenende ab
+      if (!line) return;
+
+      const parsed = parseLine(line);
+      if (!parsed) return;
+      const { name, value } = parsed;
+
+      const now = Date.now() / 1000; // Sekunden als float
+      const tsStr = new Date().toLocaleTimeString('de-DE', { hour12: false });
+
+      let entry = state.get(name);
+      if (!entry) {
+        // Neu anlegen
+        const tr = document.createElement('tr');
+        const tdName = document.createElement('td'); tdName.className = 'var'; tdName.textContent = name;
+        const tdVal  = document.createElement('td'); tdVal.className  = 'value';
+        const tdTs   = document.createElement('td'); tdTs.className   = 'ts';
+        const tdDt   = document.createElement('td'); tdDt.className   = 'dt';
+
+        tr.append(tdName, tdVal, tdTs, tdDt);
+        tbody.appendChild(tr);
+
+        entry = { val: value, tPrev: null, tLast: now, tr };
+        state.set(name, entry);
+
+        // Erste Anzeige
+        tdVal.textContent = value;
+        tdTs.textContent  = tsStr;
+        tdDt.textContent  = '—';
+
+        // Highlight
+        flashRow(tr);
+
+        // Alphabetisch einsortieren
+        reorderRows();
+      } else {
+        const tr = entry.tr;
+        const tPrev = entry.tLast;
+        const dt = (now - tPrev);
+        const [tdName, tdVal, tdTs, tdDt] = tr.children;
+
+        // Update
+        if (value !== entry.val) {
+          tdVal.textContent = value;
+          flashRow(tr);
+        }
+        tdTs.textContent = tsStr;
+        tdDt.textContent = (isFinite(dt) ? dt.toFixed(2) : '—');
+
+        entry.val = value;
+        entry.tPrev = tPrev;
+        entry.tLast = now;
+      }
+    }
+
+    // Parser wie in Python
+    function parseLine(line) {
+      // 1) "name: value" (Name unverändert inkl. Spaces)
+      const colonIdx = line.indexOf(':');
+      if (colonIdx >= 0) {
+        const name = line.slice(0, colonIdx);              // NICHT trimmen
+        const value = line.slice(colonIdx + 1).trim();     // Value leicht trimmen
+        return { name, value };
+      }
+
+      // 2) "name ... value" -> letztes Token ist der Wert
+      const parts = line.trimEnd().split(/\s+/);
+      if (parts.length >= 2) {
+        const value = parts[parts.length - 1];
+        const cut = line.lastIndexOf(value);
+        const name = line.slice(0, cut).replace(/\s+$/, ''); // trailing spaces weg
+        if (name) return { name, value };
+      }
+
+      // 3) Zahl am Zeilenende
+      const m = line.match(/^(.*?)([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$/);
+      if (m && m[1]) {
+        return { name: m[1], value: m[2] };
+      }
+
+      return null;
+    }
+
+    function flashRow(tr) {
+      tr.classList.remove('changed'); // restart animation
+      void tr.offsetWidth;            // reflow
+      tr.classList.add('changed');
+      setTimeout(() => tr.classList.remove('changed'), HILITE_MS);
+    }
+
+    function reorderRows() {
+      // Namen alphabetisch sortieren (case-insensitive)
+      const names = Array.from(state.keys());
+      names.sort((a,b) => {
+        if (SORT_CASE_INSENSITIVE) {
+          a = a.toLocaleLowerCase(); b = b.toLocaleLowerCase();
+        }
+        return a < b ? -1 : a > b ? 1 : 0;
+      });
+      // In DOM umsortieren
+      names.forEach((name, idx) => {
+        const tr = state.get(name).tr;
+        tbody.appendChild(tr); // appendChild an gleicher Stelle = move
+      });
+    }
+
+    // Feature-Check
+    if (!('serial' in navigator)) {
+      setStatus('Web Serial wird von diesem Browser nicht unterstützt', 'err');
+      connectBtn.disabled = true;
+      pickBtn.disabled = true;
+    }
+  </script>
+</body>
+</html>
