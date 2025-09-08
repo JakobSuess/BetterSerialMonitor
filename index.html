@@ -35,15 +35,22 @@
     #status.ok{color:var(--acc)}
     #status.err{color:var(--warn)}
 
-    main{padding:0 12px 12px}
+    main{
+  padding:0 12px 12px;
+  flex: 1;               /* nimmt restliche Höhe */
+  overflow-y: auto;      /* nur hier scrollen */
+}
     table{
       width:100%; border-collapse:collapse; background:var(--card);
       border:1px solid var(--border); border-radius:12px; overflow:hidden
     }
     thead th{
-      text-align:left; padding:10px; color:#b9c9dd; font-weight:600;
-      background:#0e141c; border-bottom:1px solid var(--border)
-    }
+  position: sticky;
+  top: 0;
+  z-index: 2;
+  background:#0e141c;    /* gleiche Farbe wie Header-Zeile */
+  border-bottom:1px solid var(--border);
+}
     tbody td{padding:10px; border-top:1px solid var(--border)}
     tbody tr.changed{animation:flash .6s}
     @keyframes flash{0%{background:#0f2316}100%{background:transparent}}
