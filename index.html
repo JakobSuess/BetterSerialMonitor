@@ -3,7 +3,7 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width,initial-scale=1" />
-  <title>ESP32 Live-Variablen (Web Serial)</title>
+  <title>Better Serial</title>
   <style>
     :root {
       --bg:#0b0f14; --card:#121821; --muted:#6b7a8c; --fg:#e7eef7;
@@ -63,7 +63,7 @@
 </head>
 <body>
   <header>
-    <h1>ESP32 Live-Variablen</h1>
+    <h1>Better Serial Print</h1>
     <div class="row">
       <button id="pickBtn">Port wählen</button>
       <span id="portName" class="label"></span>
@@ -101,7 +101,7 @@
 
   <footer>
     Parser: <code>name: value</code>, oder <code>name ... value</code>, oder <code>name123.4</code> (Zahl am Zeilenende).  
-    Nach Connect sendet die Seite automatisch <code>okey\n</code> an den ESP. Port-Auswahl wird gespeichert.
+    Nach Connect sendet die Seite automatisch <code>okey\n</code> über Serial. Port-Auswahl wird gespeichert.
   </footer>
 
   <script>
