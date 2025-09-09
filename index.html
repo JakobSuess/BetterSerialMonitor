@@ -66,6 +66,9 @@
     td.var { white-space: pre; }
     td.value { text-align:center }
     td.ts, td.dt { text-align:right; color:var(--muted) }
+    .tag{background:#233042; padding:2px 4px; border-radius:4px; margin-right:4px; font-size:12px}
+    #catFilters{display:flex; gap:8px; flex-wrap:wrap; padding:0 12px}
+    #catFilters label{display:flex; align-items:center; gap:4px; background:#121821; border:1px solid var(--border); padding:4px 8px; border-radius:8px}
     footer{padding:0 12px 12px; color:var(--muted); font-size:12px}
     code{background:#0d131b; padding:2px 6px; border-radius:6px; border:1px solid var(--border)}
   </style>
@@ -93,6 +96,8 @@
     </div>
     <div id="status">Disconnected</div>
   </header>
+
+  <div id="catFilters" class="row"></div>
 
   <main>
     <table id="tbl">
@@ -124,17 +129,19 @@
     let inputDone = null;
     let outputWriter = null;
     let connected = false;
-    const state = new Map(); // name -> { val, tPrevMs, tLastMs, tr }
+      const state = new Map(); // key -> { val, tPrevMs, tLastMs, tr, categories }
 
     const $ = sel => document.querySelector(sel);
     const statusEl = $('#status');
     const portNameEl = $('#portName');
-    const tbody = $('#tbody');
-    const connectBtn = $('#connectBtn');
-    const disconnectBtn = $('#disconnectBtn');
-    const pickBtn = $('#pickBtn');
-    const resetBtn = $('#resetBtn');
-    const baudSel = $('#baud');
+      const tbody = $('#tbody');
+      const connectBtn = $('#connectBtn');
+      const disconnectBtn = $('#disconnectBtn');
+      const pickBtn = $('#pickBtn');
+      const resetBtn = $('#resetBtn');
+      const baudSel = $('#baud');
+      const catFiltersEl = $('#catFilters');
+      const allCats = new Map(); // category -> checkbox
 
     function setStatus(txt, cls='') {
       statusEl.textContent = txt;
@@ -281,11 +288,13 @@
     }
 
     // ======= Reset =======
-    resetBtn.addEventListener('click', () => {
-      tbody.innerHTML = '';
-      state.clear();
-      setStatus('Reset done', '');
-    });
+      resetBtn.addEventListener('click', () => {
+        tbody.innerHTML = '';
+        state.clear();
+        catFiltersEl.innerHTML = '';
+        allCats.clear();
+        setStatus('Reset done', '');
+      });
 
     // ======= Lesen & Parsen =======
     async function readLoop() {
@@ -314,31 +323,36 @@
 
       const parsed = parseLine(line);
       if (!parsed) return;
-      const { name, value } = parsed;
+      const { name, value, categories } = parsed;
+      const key = name || categories.join(' ');
 
       const nowMs = Date.now();
       const tsStr = new Date().toLocaleTimeString('de-DE', { hour12: false });
 
-      let entry = state.get(name);
+      let entry = state.get(key);
       if (!entry) {
         // neu
         const tr = document.createElement('tr');
-        const tdName = document.createElement('td'); tdName.className = 'var';   tdName.textContent = name;
+        const tdName = document.createElement('td'); tdName.className = 'var';
         const tdVal  = document.createElement('td'); tdVal.className  = 'value';
         const tdTs   = document.createElement('td'); tdTs.className   = 'ts';
         const tdDt   = document.createElement('td'); tdDt.className   = 'dt';
 
+        renderNameCell(tdName, name, categories);
         tr.append(tdName, tdVal, tdTs, tdDt);
+        tr.dataset.categories = categories.join(' ');
         tbody.appendChild(tr);
 
-        entry = { val: value, tPrevMs: null, tLastMs: nowMs, tr };
-        state.set(name, entry);
+        entry = { val: value, tPrevMs: null, tLastMs: nowMs, tr, categories };
+        state.set(key, entry);
 
         tdVal.textContent = value;
         tdTs.textContent  = tsStr;
         tdDt.textContent  = '—';
 
         flashRow(tr);
+        updateCatFilters(categories);
+        applyCategoryFilter();
         reorderRows();
       } else {
         const tr = entry.tr;
@@ -356,17 +370,69 @@
         entry.val = value;
         entry.tPrevMs = tPrevMs;
         entry.tLastMs = nowMs;
+        entry.categories = categories;
+        renderNameCell(tdName, name, categories);
+        tr.dataset.categories = categories.join(' ');
+        updateCatFilters(categories);
+        applyCategoryFilter();
       }
     }
 
+    function renderNameCell(td, name, categories) {
+      td.textContent = '';
+      categories.forEach(cat => {
+        const s = document.createElement('span');
+        s.className = 'tag';
+        s.textContent = `[${cat}]`;
+        td.appendChild(s);
+        td.append(' ');
+      });
+      if (name) td.append(name);
+    }
+
+    function updateCatFilters(cats) {
+      cats.forEach(cat => {
+        if (allCats.has(cat)) return;
+        const label = document.createElement('label');
+        const cb = document.createElement('input');
+        cb.type = 'checkbox';
+        cb.checked = true;
+        cb.addEventListener('change', applyCategoryFilter);
+        label.append(cb, cat);
+        catFiltersEl.appendChild(label);
+        allCats.set(cat, cb);
+      });
+    }
+
+    function applyCategoryFilter() {
+      const active = new Set([...allCats.entries()].filter(([c, cb]) => cb.checked).map(([c]) => c));
+      state.forEach(entry => {
+        const show = entry.categories.every(cat => active.has(cat));
+        entry.tr.style.display = show ? '' : 'none';
+      });
+    }
+
     // Parser wie in Python
+    function extractCategories(line) {
+      const cats = [];
+      let rest = line;
+      let m;
+      while ((m = rest.match(/^\s*\[([^\]]+)\]\s*/))) {
+        cats.push(m[1]);
+        rest = rest.slice(m[0].length);
+      }
+      return { cats, rest };
+    }
+
     function parseLine(line) {
+      const { cats, rest } = extractCategories(line);
+      line = rest;
       // 1) "name: value"
       const colonIdx = line.indexOf(':');
       if (colonIdx >= 0) {
         const name = line.slice(0, colonIdx);
         const value = line.slice(colonIdx + 1).trim();
-        return { name, value };
+        return { name, value, categories: cats };
       }
       // 2) "name ... value"
       const parts = line.trimEnd().split(/\s+/);
@@ -374,11 +440,12 @@
         const value = parts[parts.length - 1];
         const cut = line.lastIndexOf(value);
         const name = line.slice(0, cut).replace(/\s+$/, '');
-        if (name) return { name, value };
+        if (name) return { name, value, categories: cats };
       }
       // 3) Zahl am Zeilenende
       const m = line.match(/^(.*?)([-+]?\d*\.?\d+(?:[eE][-+]?\d+)?)\s*$/);
-      if (m && m[1]) return { name: m[1], value: m[2] };
+      if (m && m[1]) return { name: m[1], value: m[2], categories: cats };
+      if (cats.length && line.trim()) return { name: '', value: line.trim(), categories: cats };
       return null;
     }
 
@@ -389,14 +456,21 @@
       setTimeout(() => tr.classList.remove('changed'), HILITE_MS);
     }
 
-    function reorderRows() {
-      const names = Array.from(state.keys());
-      names.sort((a,b) => {
-        if (SORT_CASE_INSENSITIVE) { a = a.toLocaleLowerCase(); b = b.toLocaleLowerCase(); }
-        return a < b ? -1 : a > b ? 1 : 0;
-      });
-      names.forEach(name => tbody.appendChild(state.get(name).tr));
-    }
+      function reorderRows() {
+        const entries = Array.from(state.entries());
+        entries.sort((a,b) => {
+          let [nameA, entryA] = a;
+          let [nameB, entryB] = b;
+          let catA = entryA.categories.join(' ');
+          let catB = entryB.categories.join(' ');
+          if (SORT_CASE_INSENSITIVE) { catA = catA.toLocaleLowerCase(); catB = catB.toLocaleLowerCase(); }
+          if (catA < catB) return -1;
+          if (catA > catB) return 1;
+          if (SORT_CASE_INSENSITIVE) { nameA = nameA.toLocaleLowerCase(); nameB = nameB.toLocaleLowerCase(); }
+          return nameA < nameB ? -1 : nameA > nameB ? 1 : 0;
+        });
+        entries.forEach(([name, entry]) => tbody.appendChild(entry.tr));
+      }
 
     // Init
     if (!('serial' in navigator)) {
