@@ -18,6 +18,11 @@
       --bg:#0b0f14; --card:#121821; --muted:#6b7a8c; --fg:#e7eef7;
       --acc:#20c05c; --warn:#e24a4a; --border:#233042;
     }
+    /* gesendete Zeilen hervorheben */
+  tbody tr.tx td { background: rgba(32,192,92,0.06); }
+    /* Graph Canvas Styling */
+    #graphContainer { margin-top: 16px; display: none; }
+    canvas { background: var(--card); border: 1px solid var(--border); border-radius: 8px; width: 100%; height: 200px; }
     html,body{height:100%}
     body{
       margin:0; font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,Arial;
@@ -75,7 +80,7 @@
 </head>
 <body>
   <header>
-    <h1>Better Serial Print</h1>
+    <h1>Better Serial Printttttt</h1>
     <div class="row">
       <button id="pickBtn">Port wählen</button>
       <span id="portName" class="label"></span>
@@ -97,8 +102,6 @@
     <div id="status">Disconnected</div>
   </header>
 
-  <div id="catFilters" class="row"></div>
-
   <main>
     <table id="tbl">
       <thead>
@@ -111,17 +114,29 @@
       </thead>
       <tbody id="tbody"></tbody>
     </table>
+    <div id="catHistoryView" style="margin-top:16px;"></div>
+    <div id="graphContainer">
+      <h3 style="margin-bottom:10px;">Live Graph: <span id="graphTitle"></span></h3>
+      <canvas id="graphCanvas"></canvas>
+    </div>
   </main>
 
   <footer>
     Parser: <code>name: value</code>, oder <code>name ... value</code>, oder <code>name123.4</code> (Zahl am Zeilenende).  
     Nach Connect sendet die Seite automatisch <code>okey\n</code> über Serial. Port-Auswahl wird gespeichert.
+    <div id="testMode" style="margin-top:12px;">
+      <label for="testInput">Test-Modus:</label>
+      <textarea id="testInput" rows="2" style="width:60%;vertical-align:middle;"></textarea>
+      <button id="testSendBtn">Senden</button>
+    </div>
   </footer>
 
   <script>
     // ======= Einstellungen =======
     const HILITE_MS = 600;
     const SORT_CASE_INSENSITIVE = true;
+    const CAT_HISTORY_SIZE = 50;
+    const AUTOSAVE_INTERVAL = 10000; // Auto-Speichern alle 10 Sekunden
 
     // ======= State =======
     let port = null;
@@ -130,6 +145,9 @@
     let outputWriter = null;
     let connected = false;
       const state = new Map(); // key -> { val, tPrevMs, tLastMs, tr, categories }
+     const allCats = new Set(); // alle bekannten Kategorien
+    let historyUpdateTimer = null; // Timer für zyklische Aktualisierung
+    let autoSaveTimer = null; // Timer für Auto-Speichern
 
     const $ = sel => document.querySelector(sel);
     const statusEl = $('#status');
@@ -141,7 +159,116 @@
       const resetBtn = $('#resetBtn');
       const baudSel = $('#baud');
       const catFiltersEl = $('#catFilters');
-      const allCats = new Map(); // category -> checkbox
+     const catHistoryView = document.getElementById('catHistoryView');
+     const catHistory = new Map(); // cat -> [{name, value, ts}]
+
+    // persistente Speicherung der Kategorie-Historie
+    function saveCatHistoryToStorage() {
+      try {
+        const obj = Object.create(null);
+        catHistory.forEach((arr, cat) => { obj[cat] = arr; });
+        localStorage.setItem('catHistory', JSON.stringify(obj));
+        // zusätzlich jede Kategorie einzeln speichern (robuster)
+        catHistory.forEach((arr, cat) => {
+          try { localStorage.setItem('catHistory:' + cat, JSON.stringify(arr)); } catch(e) {}
+        });
+        console.log('catHistory saved', Object.keys(obj));
+      } catch (e) { console.warn('saveCatHistoryToStorage failed', e); }
+    }
+
+    function loadCatHistoryFromStorage() {
+      try {
+        // erst kombiniertes Objekt
+        const raw = localStorage.getItem('catHistory');
+        if (raw) {
+          try {
+            const obj = JSON.parse(raw);
+            Object.keys(obj).forEach(cat => {
+              const arr = Array.isArray(obj[cat]) ? obj[cat] : [];
+              catHistory.set(cat, arr.slice(-CAT_HISTORY_SIZE));
+            });
+            console.log('catHistory loaded (combined)', Object.keys(obj));
+          } catch (e) { console.warn('failed to parse combined catHistory', e); }
+        }
+        // zusätzlich einzelne Keys prüfen (überschreibt/ergänzt)
+        for (let i=0;i<localStorage.length;i++) {
+          const key = localStorage.key(i);
+          if (key && key.startsWith('catHistory:')) {
+            const cat = key.slice('catHistory:'.length);
+            try {
+              const arr = JSON.parse(localStorage.getItem(key)) || [];
+              catHistory.set(cat, Array.isArray(arr) ? arr.slice(-CAT_HISTORY_SIZE) : []);
+              console.log('catHistory loaded (single)', cat, (arr||[]).length);
+            } catch(e) { /* ignore */ }
+          }
+        }
+      } catch (e) { console.warn('loadCatHistoryFromStorage failed', e); }
+    }
+
+    // Persistenter Table-State (aktuelle Einträge)
+    function saveMonitorStateToStorage() {
+      try {
+        const obj = Object.create(null);
+        state.forEach((entry, key) => {
+          obj[key] = { val: entry.val, tLastMs: entry.tLastMs, categories: entry.categories, name: entry.name || '' };
+        });
+        localStorage.setItem('monitorState', JSON.stringify(obj));
+        console.log('monitorState saved', Object.keys(obj).length);
+      } catch (e) { console.warn('saveMonitorStateToStorage failed', e); }
+    }
+
+    function loadMonitorStateFromStorage() {
+      try {
+        const raw = localStorage.getItem('monitorState');
+        if (!raw) return;
+        const obj = JSON.parse(raw);
+        Object.keys(obj).forEach(key => {
+          const it = obj[key];
+          const name = it.name || '';
+          const categories = Array.isArray(it.categories) ? it.categories : [];
+          const value = it.val;
+          const nowMs = it.tLastMs || Date.now();
+
+          // create row like handleLine does
+          if (state.has(key)) return;
+          const tr = document.createElement('tr');
+          const tdName = document.createElement('td'); tdName.className = 'var';
+          const tdVal  = document.createElement('td'); tdVal.className  = 'value';
+          const tdTs   = document.createElement('td'); tdTs.className   = 'ts';
+          const tdDt   = document.createElement('td'); tdDt.className   = 'dt';
+          renderNameCell(tdName, name, categories);
+          tr.append(tdName, tdVal, tdTs, tdDt);
+          tr.dataset.categories = categories.join(' ');
+          tbody.appendChild(tr);
+
+          tdVal.textContent = value;
+          tdTs.textContent = new Date(nowMs).toLocaleTimeString('de-DE', { hour12: false });
+          tdDt.textContent = '—';
+
+          const entry = { val: value, tPrevMs: null, tLastMs: nowMs, tr, categories, name };
+          state.set(key, entry);
+          updateCatFilters(categories);
+        });
+        reorderRows();
+        console.log('monitorState loaded', Object.keys(obj).length);
+      } catch (e) { console.warn('loadMonitorStateToStorage failed', e); }
+    }
+
+    // Beim Hinzufügen die src-Information korrekt setzen (wird in handleLine übergeben)
+    function addToCatHistory(categories, name, value, ts, source='rx') {
+      categories = Array.isArray(categories) ? categories : [];
+      categories.forEach(cat => {
+        if (!catHistory.has(cat)) catHistory.set(cat, []);
+        const arr = catHistory.get(cat);
+        arr.push({ name, value, ts, src: source, categories: categories.slice() });
+        while (arr.length > CAT_HISTORY_SIZE) arr.shift();
+      });
+      saveCatHistoryToStorage();
+    }
+
+    // beim Laden Daten wiederherstellen
+    loadCatHistoryFromStorage();
+    loadMonitorStateFromStorage();
 
     function setStatus(txt, cls='') {
       statusEl.textContent = txt;
@@ -288,13 +415,26 @@
     }
 
     // ======= Reset =======
-      resetBtn.addEventListener('click', () => {
-        tbody.innerHTML = '';
-        state.clear();
-        catFiltersEl.innerHTML = '';
-        allCats.clear();
-        setStatus('Reset done', '');
-      });
+    resetBtn.addEventListener('click', () => {
+      tbody.innerHTML = '';
+      state.clear();
+      catFiltersEl.innerHTML = '';
+      allCats.clear();
+      catHistory.clear();
+      catHistoryView.innerHTML = '';
+      saveCatHistoryToStorage();
+      // Auch den monitorState löschen
+      localStorage.removeItem('monitorState');
+      // Timer anhalten, falls aktiv
+      if (historyUpdateTimer) {
+        clearInterval(historyUpdateTimer);
+        historyUpdateTimer = null;
+      }
+      // Aktive Auswahl zurücksetzen
+      activeSelection = null;
+      console.log('Monitor state und History gelöscht');
+      setStatus('Reset done', '');
+    });
 
     // ======= Lesen & Parsen =======
     async function readLoop() {
@@ -311,13 +451,13 @@
             if (!match) break;
             const line = match[1];
             buffer = buffer.slice(match[0].length);
-            handleLine(line);
+            handleLine(line, 'rx');
           }
         }
       }
     }
 
-    function handleLine(rawLine) {
+    function handleLine(rawLine, source='rx') {
       const line = rawLine.replace(/\r?\n$/, '');
       if (!line) return;
 
@@ -343,13 +483,16 @@
         tr.dataset.categories = categories.join(' ');
         tbody.appendChild(tr);
 
-        entry = { val: value, tPrevMs: null, tLastMs: nowMs, tr, categories };
+        entry = { val: value, tPrevMs: null, tLastMs: nowMs, tr, categories, name };
         state.set(key, entry);
 
         tdVal.textContent = value;
         tdTs.textContent  = tsStr;
         tdDt.textContent  = '—';
 
+        // Quelle markieren
+        if (source === 'tx') tr.classList.add('tx');
+        else tr.classList.remove('tx');
         flashRow(tr);
         updateCatFilters(categories);
         applyCategoryFilter();
@@ -371,56 +514,274 @@
         entry.tPrevMs = tPrevMs;
         entry.tLastMs = nowMs;
         entry.categories = categories;
+        entry.name = name;
+        // Quelle markieren
+        if (source === 'tx') tr.classList.add('tx'); else tr.classList.remove('tx');
         renderNameCell(tdName, name, categories);
         tr.dataset.categories = categories.join(' ');
         updateCatFilters(categories);
         applyCategoryFilter();
       }
+      addToCatHistory(categories, name, value, tsStr, source);
+      saveMonitorStateToStorage();
     }
 
     function renderNameCell(td, name, categories) {
       td.textContent = '';
+      const primary = Array.isArray(categories) && categories.length ? categories[0] : null;
       categories.forEach(cat => {
         const s = document.createElement('span');
         s.className = 'tag';
         s.textContent = `[${cat}]`;
+        s.style.cursor = 'pointer';
+        // primary mitschreiben
+        if (primary) s.dataset.primary = primary;
+        s.addEventListener('click', () => onCatTagClick(cat, primary));
         td.appendChild(s);
         td.append(' ');
       });
       if (name) td.append(name);
     }
 
-    function updateCatFilters(cats) {
-      cats.forEach(cat => {
-        if (allCats.has(cat)) return;
-        const label = document.createElement('label');
-        const cb = document.createElement('input');
-        cb.type = 'checkbox';
-        cb.checked = true;
-        cb.addEventListener('change', applyCategoryFilter);
-        label.append(cb, cat);
-        catFiltersEl.appendChild(label);
-        allCats.set(cat, cb);
+    // Tag-Click: Historie anzeigen
+    // aktive Auswahl: { primary: 'fram', sub: 'write' } oder { primary: 'fram', sub: null }
+    let activeSelection = null;
+    function onCatTagClick(cat, primary) {
+      // Wenn kein primary übergeben, primary = cat
+      primary = primary || cat;
+      // Wenn erneut Klick auf gleiche Auswahl -> ausblenden
+      if (activeSelection && activeSelection.primary === primary && activeSelection.sub === cat) {
+        activeSelection = null;
+        // Timer stoppen wenn History geschlossen wird
+        if (historyUpdateTimer) {
+          clearInterval(historyUpdateTimer);
+          historyUpdateTimer = null;
+        }
+      } else {
+        // Wenn Klick auf Haupt-Tag -> sub null
+        if (primary === cat) activeSelection = { primary: primary, sub: null };
+        else activeSelection = { primary: primary, sub: cat };
+        
+        // Bestehenden Timer stoppen
+        if (historyUpdateTimer) {
+          clearInterval(historyUpdateTimer);
+        }
+        
+        // Neuen Timer für zyklische Aktualisierung starten (alle 2 Sekunden)
+        historyUpdateTimer = setInterval(() => {
+          if (activeSelection) renderCatHistoryView();
+        }, 2000);
+      }
+      renderCatHistoryView();
+    }
+
+    function clearTagHighlights() {
+      tbody.querySelectorAll('.tag').forEach(tagEl => {
+        tagEl.style.background = '';
+        tagEl.style.color = '';
       });
     }
 
-    function applyCategoryFilter() {
-      const active = new Set([...allCats.entries()].filter(([c, cb]) => cb.checked).map(([c]) => c));
-      state.forEach(entry => {
-        const show = entry.categories.every(cat => active.has(cat));
-        entry.tr.style.display = show ? '' : 'none';
+    function renderCatHistoryView() {
+      if (!activeSelection) {
+        catHistoryView.innerHTML = '';
+        // Graph ausblenden wenn History ausgeblendet wird
+        document.getElementById('graphContainer').style.display = 'none';
+        // Tabelle normal anzeigen
+        tbody.parentElement.style.display = '';
+        clearTagHighlights();
+        return;
+      }
+      const primary = activeSelection.primary;
+      const sub = activeSelection.sub;
+      // Bei Kombination: nutze die History der Hauptkategorie und filtere
+      const baseArr = catHistory.get(primary) || [];
+      const arr = baseArr.filter(it => {
+        const cats = Array.isArray(it.categories) ? it.categories : [];
+        if (cats.length === 0) return false;
+        if (cats[0] !== primary) return false; // nur Einträge mit dieser Hauptkategorie
+        if (!sub) return true;
+        return cats.includes(sub);
       });
+
+      //let title = sub ? `${primary} + ${sub}` : primary;
+      // formatierten Titel als [PRIMARY] [SUB]
+      const formattedTitle = sub ? `[${primary}] [${sub}]` : `[${primary}]`;
+      let html = `<div style="display:flex;align-items:center;justify-content:space-between">
+        <h3 style='margin:0'>Letzte ${CAT_HISTORY_SIZE} Werte für ${formattedTitle}</h3>
+        <div>
+          <button id='closeHistoryBtn'>Schließen</button>
+        </div>
+      </div>`;
+      if (!arr.length) {
+        html += '<i>Keine Werte vorhanden</i>';
+      } else {
+        html += '<div style="max-height:300px;overflow-y:auto;border:1px solid var(--border);border-radius:8px;background:#121821;padding:8px;">';
+        arr.slice(-CAT_HISTORY_SIZE).reverse().forEach(item => {
+          const tag = item.src === 'tx' ? '<span style="color:#20c05c">(tx)</span>' : '<span style="color:var(--muted)">(rx)</span>';
+          html += `<div style='padding:4px 0;border-bottom:1px solid var(--border);'><b>${item.name}</b> ${tag}: <span>${item.value}</span> <span style='color:var(--muted);font-size:12px'>${item.ts}</span></div>`;
+        });
+        html += '</div>';
+      }
+      catHistoryView.innerHTML = html;
+      
+      // Graph anzeigen und mit Daten füllen
+      renderHistoryGraph(arr, formattedTitle);
+      
+      // Nur Tabelle ausblenden, Test-Eingabe bleibt sichtbar
+      tbody.parentElement.style.display = 'none';
+      // Tags visuell hervorheben: markiere nur Tags mit matching primary and sub
+      tbody.querySelectorAll('.tag').forEach(tagEl => {
+        const text = tagEl.textContent.replace(/\[|\]/g, '');
+        const elPrimary = tagEl.dataset.primary || '';
+        if (sub) {
+          if (text === sub && elPrimary === primary) {
+            tagEl.style.background = '#20c05c'; tagEl.style.color = '#fff';
+          } else { tagEl.style.background = ''; tagEl.style.color = ''; }
+        } else {
+          if (text === primary) { tagEl.style.background = '#20c05c'; tagEl.style.color = '#fff'; }
+          else { tagEl.style.background = ''; tagEl.style.color = ''; }
+        }
+      });
+      
+      // Refresh-Button
+      const refreshBtn = document.getElementById('refreshHistoryBtn');
+      if (refreshBtn) {
+        refreshBtn.addEventListener('click', () => {
+          // Manuelle Aktualisierung der Ansicht
+          renderCatHistoryView();
+        });
+      }
+      
+      const closeBtn = document.getElementById('closeHistoryBtn');
+      if (closeBtn) {
+        closeBtn.addEventListener('click', () => {
+          activeSelection = null;
+         // Timer stoppen, wenn History geschlossen wird
+         if (historyUpdateTimer) {
+           clearInterval(historyUpdateTimer);
+           historyUpdateTimer = null;
+         }
+          renderCatHistoryView();
+        });
+      }
+    }
+
+    // Funktion zum Rendern des Live-Graphen
+    function renderHistoryGraph(dataPoints, title) {
+      const graphContainer = document.getElementById('graphContainer');
+      const graphTitle = document.getElementById('graphTitle');
+      const canvas = document.getElementById('graphCanvas');
+      const ctx = canvas.getContext('2d');
+      
+      // Filtere numerische Werte aus den Datenpunkten
+      const numericData = dataPoints
+        .map(item => ({ value: parseFloat(item.value), ts: item.ts }))
+        .filter(item => !isNaN(item.value));
+      
+      if (numericData.length < 2) {
+        // Nicht genug numerische Daten für einen sinnvollen Graphen
+        graphContainer.style.display = 'none';
+        return;
+      }
+      
+      // Anzeigen und Titel setzen
+      graphContainer.style.display = 'block';
+      graphTitle.textContent = title;
+      
+      // Canvas-Größe anpassen
+      const dpr = window.devicePixelRatio || 1;
+      const rect = canvas.getBoundingClientRect();
+      canvas.width = rect.width * dpr;
+      canvas.height = rect.height * dpr;
+      ctx.scale(dpr, dpr);
+      
+      // Daten vorbereiten
+      const width = rect.width;
+      const height = rect.height;
+      const padding = 30; // Platz für Achsenbeschriftungen
+      
+      // Min/Max-Werte ermitteln
+      const values = numericData.map(d => d.value);
+      let min = Math.min(...values);
+      let max = Math.max(...values);
+      
+      // Puffer für Y-Achse
+      const yBuffer = (max - min) * 0.1;
+      min -= yBuffer;
+      max += yBuffer;
+      
+      // Hintergrund
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--card').trim();
+      ctx.fillRect(0, 0, width, height);
+      
+      // Achsen
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--border').trim();
+      ctx.beginPath();
+      ctx.moveTo(padding, padding);
+      ctx.lineTo(padding, height - padding);
+      ctx.lineTo(width - padding, height - padding);
+      ctx.stroke();
+      
+      // Wenn nicht genug Platz zwischen min und max, verwende Standard-Achsen
+      if (Math.abs(max - min) < 0.00001) {
+        min = 0;
+        max = 1;
+      }
+      
+      // Zeichne Punkte und Linien
+      const xStep = (width - 2 * padding) / (numericData.length - 1);
+      ctx.strokeStyle = getComputedStyle(document.documentElement).getPropertyValue('--acc').trim();
+      ctx.fillStyle = ctx.strokeStyle;
+      ctx.lineWidth = 2;
+      ctx.beginPath();
+      
+      numericData.forEach((point, i) => {
+        const x = padding + i * xStep;
+        const y = height - padding - ((point.value - min) / (max - min)) * (height - 2 * padding);
+        
+        if (i === 0) {
+          ctx.moveTo(x, y);
+        } else {
+          ctx.lineTo(x, y);
+        }
+        
+        // Punkte
+        ctx.fillRect(x - 3, y - 3, 6, 6);
+      });
+      
+      ctx.stroke();
+      
+      // Y-Achsen-Beschriftung
+      ctx.fillStyle = getComputedStyle(document.documentElement).getPropertyValue('--muted').trim();
+      ctx.font = '10px sans-serif';
+      ctx.textAlign = 'right';
+      ctx.textBaseline = 'middle';
+      
+      // Min/Max auf Y-Achse
+      ctx.fillText(max.toFixed(2), padding - 5, padding);
+      ctx.fillText(min.toFixed(2), padding - 5, height - padding);
+      
+      // Zeitstempel auf X-Achse
+      ctx.textAlign = 'center';
+      ctx.textBaseline = 'top';
+      if (numericData.length > 0) {
+        // Ersten und letzten Zeitstempel
+        ctx.fillText(numericData[0].ts, padding, height - padding + 5);
+        if (numericData.length > 1) {
+          ctx.fillText(numericData[numericData.length - 1].ts, width - padding, height - padding + 5);
+        }
+      }
     }
 
     // Parser wie in Python
     function extractCategories(line) {
       const cats = [];
-      let rest = line;
-      let m;
-      while ((m = rest.match(/^\s*\[([^\]]+)\]\s*/))) {
-        cats.push(m[1]);
-        rest = rest.slice(m[0].length);
-      }
+      // Alle [cat] Vorkommen überall in der Zeile finden und entfernen
+      const rest = line.replace(/\[([^\]]+)\]/g, (_, g1) => {
+        cats.push(g1);
+        return ' ';
+      }).trim();
       return { cats, rest };
     }
 
@@ -481,6 +842,103 @@
       // beim Laden: zuvor gewählten Port (falls erlaubt) wiederherstellen
       restorePort().then(updatePortName);
     }
+
+    // Test-Modus: Serial-Nachrichten manuell verarbeiten
+    const testSendBtn = document.getElementById('testSendBtn');
+    const testInput = document.getElementById('testInput');
+
+    function sendTestInput() {
+      const raw = testInput.value;
+      if (!raw) return;
+      const lines = raw.split(/\r?\n/);
+      for (const line of lines) {
+        if (!line || !line.trim()) continue;
+        // sende über Serial, falls verbunden
+        if (connected && port && port.writable) {
+          try {
+            const writer = port.writable.getWriter();
+            const enc = new TextEncoder();
+            writer.write(enc.encode(line + '\n'));
+            writer.releaseLock();
+          } catch (e) { console.warn('Serial write failed', e); }
+        }
+        // lokale Anzeige & Speicherung als gesendet
+        handleLine(line, 'tx');
+      }
+      // Text bleibt erhalten
+      testInput.focus();
+    }
+
+    testSendBtn.addEventListener('click', sendTestInput);
+
+    // Enter ohne Shift sendet, Shift+Enter neue Zeile
+    testInput.addEventListener('keydown', (ev) => {
+      if (ev.key === 'Enter' && !ev.shiftKey) {
+        ev.preventDefault();
+        sendTestInput();
+      }
+    });
+    // Update Category Filters - baut die Filter-Checkboxen
+    function updateCatFilters(categories) {
+      if (!Array.isArray(categories)) return;
+      let changed = false;
+      categories.forEach(cat => {
+        if (!allCats.has(cat)) {
+          allCats.add(cat);
+          changed = true;
+        }
+      });
+      if (!changed) return;
+      catFiltersEl.innerHTML = '';
+      Array.from(allCats).sort().forEach(cat => {
+        const label = document.createElement('label');
+        const chk = document.createElement('input');
+        chk.type = 'checkbox';
+        chk.checked = true;
+        chk.addEventListener('change', applyCategoryFilter);
+        chk.dataset.cat = cat;
+        label.appendChild(chk);
+        label.append(cat);
+        catFiltersEl.appendChild(label);
+      });
+    }
+
+    // Filter anwenden - zeigt nur Zeilen mit aktiven Kategorien
+    function applyCategoryFilter() {
+      const activeFilters = Array.from(catFiltersEl.querySelectorAll('input:checked')).map(chk => chk.dataset.cat);
+      Array.from(tbody.children).forEach(tr => {
+        const cats = tr.dataset.categories ? tr.dataset.categories.split(' ') : [];
+        const visible = cats.some(cat => activeFilters.includes(cat));
+        tr.style.display = visible || !cats.length ? '' : 'none';
+      });
+    }
+
+    // Debugging: lokalen Storage anzeigen
+    console.log('--- localStorage keys ---');
+    for (let i=0; i<localStorage.length; i++) {
+      const key = localStorage.key(i);
+      console.log(key, localStorage.getItem(key).length, 'chars');
+    }
+    console.log('------------------------');
+
+    // Auto-Save Funktion
+    function autoSave() {
+      try {
+        saveCatHistoryToStorage();
+        saveMonitorStateToStorage();
+        console.log('Auto-Save durchgeführt:', new Date().toLocaleTimeString());
+      } catch (e) {
+        console.warn('Auto-Save fehlgeschlagen', e);
+      }
+    }
+    // Auto-Save Timer starten
+    autoSaveTimer = setInterval(autoSave, AUTOSAVE_INTERVAL);
+
+    // Bei Beenden der Seite Daten speichern
+    window.addEventListener('beforeunload', () => {
+      autoSave();
+    });
+
   </script>
 </body>
 </html>
